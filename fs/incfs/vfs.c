@@ -318,6 +318,222 @@ static struct inode *fetch_regular_inode(struct super_block *sb,
 	return inode;
 }
 
+static ssize_t pending_reads_read(struct file *f, char __user *buf, size_t len,
+			    loff_t *ppos)
+{
+	struct pending_reads_state *pr_state = f->private_data;
+	struct mount_info *mi = get_mount_info(file_superblock(f));
+	struct incfs_pending_read_info *reads_buf = NULL;
+	size_t reads_to_collect = len / sizeof(*reads_buf);
+	int last_known_read_sn = READ_ONCE(pr_state->last_pending_read_sn);
+	int new_max_sn = last_known_read_sn;
+	int reads_collected = 0;
+	ssize_t result = 0;
+	int i = 0;
+
+	if (!incfs_fresh_pending_reads_exist(mi, last_known_read_sn))
+		return 0;
+
+	reads_buf = (struct incfs_pending_read_info *)get_zeroed_page(GFP_NOFS);
+	if (!reads_buf)
+		return -ENOMEM;
+
+	reads_to_collect =
+		min_t(size_t, PAGE_SIZE / sizeof(*reads_buf), reads_to_collect);
+
+	reads_collected = incfs_collect_pending_reads(
+		mi, last_known_read_sn, reads_buf, reads_to_collect);
+	if (reads_collected < 0) {
+		result = reads_collected;
+		goto out;
+	}
+
+	for (i = 0; i < reads_collected; i++)
+		if (reads_buf[i].serial_number > new_max_sn)
+			new_max_sn = reads_buf[i].serial_number;
+
+	/*
+	 * Just to make sure that we don't accidentally copy more data
+	 * to reads buffer than userspace can handle.
+	 */
+	reads_collected = min_t(size_t, reads_collected, reads_to_collect);
+	result = reads_collected * sizeof(*reads_buf);
+
+	/* Copy reads info to the userspace buffer */
+	if (copy_to_user(buf, reads_buf, result)) {
+		result = -EFAULT;
+		goto out;
+	}
+
+	WRITE_ONCE(pr_state->last_pending_read_sn, new_max_sn);
+	*ppos = 0;
+out:
+	if (reads_buf)
+		free_page((unsigned long)reads_buf);
+	return result;
+}
+
+
+static __poll_t pending_reads_poll(struct file *file, poll_table *wait)
+{
+	struct pending_reads_state *state = file->private_data;
+	struct mount_info *mi = get_mount_info(file_superblock(file));
+	__poll_t ret = 0;
+
+	poll_wait(file, &mi->mi_pending_reads_notif_wq, wait);
+	if (incfs_fresh_pending_reads_exist(mi,
+					    state->last_pending_read_sn))
+		ret = EPOLLIN | EPOLLRDNORM;
+
+	return ret;
+}
+
+static int pending_reads_open(struct inode *inode, struct file *file)
+{
+	struct pending_reads_state *state = NULL;
+
+	state = kzalloc(sizeof(*state), GFP_NOFS);
+	if (!state)
+		return -ENOMEM;
+
+	file->private_data = state;
+	return 0;
+}
+
+static int pending_reads_release(struct inode *inode, struct file *file)
+{
+	kfree(file->private_data);
+	return 0;
+}
+
+static struct inode *fetch_pending_reads_inode(struct super_block *sb)
+{
+	struct inode_search search = {
+		.ino = INCFS_PENDING_READS_INODE
+	};
+	struct inode *inode = iget5_locked(sb, search.ino, inode_test,
+				inode_set, &search);
+
+	if (!inode)
+		return ERR_PTR(-ENOMEM);
+
+	if (inode->i_state & I_NEW)
+		unlock_new_inode(inode);
+
+	return inode;
+}
+
+static int log_open(struct inode *inode, struct file *file)
+{
+	struct log_file_state *log_state = NULL;
+	struct mount_info *mi = get_mount_info(file_superblock(file));
+
+	log_state = kzalloc(sizeof(*log_state), GFP_NOFS);
+	if (!log_state)
+		return -ENOMEM;
+
+	log_state->state = incfs_get_log_state(mi);
+	file->private_data = log_state;
+	return 0;
+}
+
+static int log_release(struct inode *inode, struct file *file)
+{
+	kfree(file->private_data);
+	return 0;
+}
+
+static ssize_t log_read(struct file *f, char __user *buf, size_t len,
+			loff_t *ppos)
+{
+	struct log_file_state *log_state = f->private_data;
+	struct mount_info *mi = get_mount_info(file_superblock(f));
+	int total_reads_collected = 0;
+	int rl_size;
+	ssize_t result = 0;
+	struct incfs_pending_read_info *reads_buf;
+	ssize_t reads_to_collect = len / sizeof(*reads_buf);
+	ssize_t reads_per_page = PAGE_SIZE / sizeof(*reads_buf);
+
+	rl_size = READ_ONCE(mi->mi_log.rl_size);
+	if (rl_size == 0)
+		return 0;
+
+	reads_buf = (struct incfs_pending_read_info *)__get_free_page(GFP_NOFS);
+	if (!reads_buf)
+		return -ENOMEM;
+
+	reads_to_collect = min_t(ssize_t, rl_size, reads_to_collect);
+	while (reads_to_collect > 0) {
+		struct read_log_state next_state;
+		int reads_collected;
+
+		memcpy(&next_state, &log_state->state, sizeof(next_state));
+		reads_collected = incfs_collect_logged_reads(
+			mi, &next_state, reads_buf,
+			min_t(ssize_t, reads_to_collect, reads_per_page));
+		if (reads_collected <= 0) {
+			result = total_reads_collected ?
+					 total_reads_collected *
+						 sizeof(*reads_buf) :
+					 reads_collected;
+			goto out;
+		}
+		if (copy_to_user(buf, reads_buf,
+				 reads_collected * sizeof(*reads_buf))) {
+			result = total_reads_collected ?
+					 total_reads_collected *
+						 sizeof(*reads_buf) :
+					 -EFAULT;
+			goto out;
+		}
+
+		memcpy(&log_state->state, &next_state, sizeof(next_state));
+		total_reads_collected += reads_collected;
+		buf += reads_collected * sizeof(*reads_buf);
+		reads_to_collect -= reads_collected;
+	}
+
+	result = total_reads_collected * sizeof(*reads_buf);
+	*ppos = 0;
+out:
+	if (reads_buf)
+		free_page((unsigned long)reads_buf);
+	return result;
+}
+
+static __poll_t log_poll(struct file *file, poll_table *wait)
+{
+	struct log_file_state *log_state = file->private_data;
+	struct mount_info *mi = get_mount_info(file_superblock(file));
+	int count;
+	__poll_t ret = 0;
+
+	poll_wait(file, &mi->mi_log.ml_notif_wq, wait);
+	count = incfs_get_uncollected_logs_count(mi, &log_state->state);
+	if (count >= mi->mi_options.read_log_wakeup_count)
+		ret = EPOLLIN | EPOLLRDNORM;
+
+	return ret;
+}
+
+static struct inode *fetch_log_inode(struct super_block *sb)
+{
+	struct inode_search search = {
+		.ino = INCFS_LOG_INODE
+	};
+	struct inode *inode = iget5_locked(sb, search.ino, inode_test,
+				inode_set, &search);
+
+	if (!inode)
+		return ERR_PTR(-ENOMEM);
+
+	if (inode->i_state & I_NEW)
+		unlock_new_inode(inode);
+
+	return inode;
+}
+
 static int iterate_incfs_dir(struct file *file, struct dir_context *ctx)
 {
 	struct dir_file *dir = get_incfs_dir_file(file);
@@ -495,7 +711,137 @@ err:
 	return result;
 }
 
-int incfs_link(struct dentry *what, struct dentry *where)
+static char *file_id_to_str(incfs_uuid_t id)
+{
+	char *result = kmalloc(1 + sizeof(id.bytes) * 2, GFP_NOFS);
+	char *end;
+
+	if (!result)
+		return NULL;
+
+	end = bin2hex(result, id.bytes, sizeof(id.bytes));
+	*end = 0;
+	return result;
+}
+
+static struct mem_range incfs_copy_signature_info_from_user(u8 __user *original,
+							    u64 size)
+{
+	u8 *result;
+
+	if (!original)
+		return range(NULL, 0);
+
+	if (size > INCFS_MAX_SIGNATURE_SIZE)
+		return range(ERR_PTR(-EFAULT), 0);
+
+	result = kzalloc(size, GFP_NOFS | __GFP_COMP);
+	if (!result)
+		return range(ERR_PTR(-ENOMEM), 0);
+
+	if (copy_from_user(result, original, size)) {
+		kfree(result);
+		return range(ERR_PTR(-EFAULT), 0);
+	}
+
+	return range(result, size);
+}
+
+static int init_new_file(struct mount_info *mi, struct dentry *dentry,
+			 incfs_uuid_t *uuid, u64 size, struct mem_range attr,
+			 u8 __user *user_signature_info, u64 signature_size)
+{
+	struct path path = {};
+	struct file *new_file;
+	int error = 0;
+	struct backing_file_context *bfc = NULL;
+	u32 block_count;
+	struct mem_range raw_signature = { NULL };
+	struct mtree *hash_tree = NULL;
+
+	if (!mi || !dentry || !uuid)
+		return -EFAULT;
+
+	/* Resize newly created file to its true size. */
+	path = (struct path) {
+		.mnt = mi->mi_backing_dir_path.mnt,
+		.dentry = dentry
+	};
+	new_file = dentry_open(&path, O_RDWR | O_NOATIME | O_LARGEFILE,
+			       current_cred());
+
+	if (IS_ERR(new_file)) {
+		error = PTR_ERR(new_file);
+		goto out;
+	}
+
+	bfc = incfs_alloc_bfc(mi, new_file);
+	fput(new_file);
+	if (IS_ERR(bfc)) {
+		error = PTR_ERR(bfc);
+		bfc = NULL;
+		goto out;
+	}
+
+	mutex_lock(&bfc->bc_mutex);
+	error = incfs_write_fh_to_backing_file(bfc, uuid, size);
+	if (error)
+		goto out;
+
+	if (attr.data && attr.len) {
+		error = incfs_write_file_attr_to_backing_file(bfc,
+							attr, NULL);
+		if (error)
+			goto out;
+	}
+
+	block_count = (u32)get_blocks_count_for_size(size);
+
+	if (user_signature_info) {
+		raw_signature = incfs_copy_signature_info_from_user(
+			user_signature_info, signature_size);
+
+		if (IS_ERR(raw_signature.data)) {
+			error = PTR_ERR(raw_signature.data);
+			raw_signature.data = NULL;
+			goto out;
+		}
+
+		hash_tree = incfs_alloc_mtree(raw_signature, block_count);
+		if (IS_ERR(hash_tree)) {
+			error = PTR_ERR(hash_tree);
+			hash_tree = NULL;
+			goto out;
+		}
+
+		error = incfs_write_signature_to_backing_file(
+			bfc, raw_signature, hash_tree->hash_tree_area_size);
+		if (error)
+			goto out;
+
+		block_count += get_blocks_count_for_size(
+			hash_tree->hash_tree_area_size);
+	}
+
+	if (block_count)
+		error = incfs_write_blockmap_to_backing_file(bfc, block_count);
+
+	if (error)
+		goto out;
+out:
+	if (bfc) {
+		mutex_unlock(&bfc->bc_mutex);
+		incfs_free_bfc(bfc);
+	}
+	incfs_free_mtree(hash_tree);
+	kfree(raw_signature.data);
+
+	if (error)
+		pr_debug("incfs: %s error: %d\n", __func__, error);
+	return error;
+}
+
+static int incfs_link(struct dentry *what, struct dentry *where)
 {
 	struct dentry *parent_dentry = dget_parent(where);
 	struct inode *pinode = d_inode(parent_dentry);
@@ -537,7 +883,45 @@ static int incfs_rmdir(struct dentry *dentry)
 	return error;
 }
 
-static void maybe_delete_incomplete_file(struct data_file *df)
+static int dir_relative_path_resolve(
+			struct mount_info *mi,
+			const char __user *relative_path,
+			struct path *result_path)
+{
+	struct path *base_path = &mi->mi_backing_dir_path;
+	int dir_fd = get_unused_fd_flags(0);
+	struct file *dir_f = NULL;
+	int error = 0;
+
+	if (dir_fd < 0)
+		return dir_fd;
+
+	dir_f = dentry_open(base_path, O_RDONLY | O_NOATIME, current_cred());
+
+	if (IS_ERR(dir_f)) {
+		error = PTR_ERR(dir_f);
+		goto out;
+	}
+	fd_install(dir_fd, dir_f);
+
+	if (!relative_path) {
+		/* No relative path given, just return the base dir. */
+		*result_path = *base_path;
+		path_get(result_path);
+		goto out;
+	}
+
+	error = user_path_at_empty(dir_fd, relative_path,
+		LOOKUP_FOLLOW | LOOKUP_DIRECTORY, result_path, NULL);
+
+out:
+	sys_close(dir_fd);
+	if (error)
+		pr_debug("incfs: %s %d\n", __func__, error);
+	return error;
+}
+
+static int validate_name(char *file_name)
 {
 	char *file_id_str;
 	struct dentry *incomplete_file_dentry;
@@ -1219,19 +1603,13 @@ static int file_open(struct inode *inode, struct file *file)
 	struct file *backing_file = NULL;
 	struct path backing_path = {};
 	int err = 0;
-	int flags = O_NOATIME | O_LARGEFILE |
-		(S_ISDIR(inode->i_mode) ? O_RDONLY : O_RDWR);
-
-	WARN_ON(file->private_data);
-
-	if (!mi)
-		return -EBADF;
+	const struct cred *old_cred;
 
 	get_incfs_backing_path(file->f_path.dentry, &backing_path);
-	if (!backing_path.dentry)
-		return -EBADF;
-
-	backing_file = dentry_open(&backing_path, flags, mi->mi_owner);
+	old_cred = override_creds(mi->mi_owner);
+	backing_file = dentry_open(&backing_path,
+			O_RDWR | O_NOATIME | O_LARGEFILE, current_cred());
+	revert_creds(old_cred);
 	path_put(&backing_path);
 
 	if (IS_ERR(backing_file)) {
