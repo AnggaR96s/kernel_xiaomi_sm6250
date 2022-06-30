@@ -1,0 +1,31 @@
+name: Compile Kernel
+
+on:
+    push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: gengkapak/build:latest
+    steps:
+      - uses: actions/checkout@master
+        with:
+          submodules: recursive
+          fetch-depth: 5
+      - run: |
+          git log --oneline -n 5 >> Changelog.txt
+      - name: Send Changelog
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.CHAT_ID }}
+          token: ${{ secrets.BOT_API_TOKEN }}
+          message: Build Started.
+          document: Changelog.txt
+      - run: |
+          curl https://gist.githubusercontent.com/AnggaR96s/0f738746b60d17c5d976ef8bc84a6e5e/raw/83b8a8d5e8da1fdcee3738f454dbe101e159c2ac/build.sh | bash
+      - name: Send ZIP
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.CHAT_ID }}
+          token: ${{ secrets.BOT_API_TOKEN }}
+          message: Build Complete.
+          document: $ZIPNAME
